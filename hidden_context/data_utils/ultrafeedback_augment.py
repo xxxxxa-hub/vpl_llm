@@ -92,7 +92,7 @@ def inner_join(original, binarized, augment_type, users, two_two_only=False, fil
                 continue
         if not flag or len(chosen_ratings) != 4 or len(rejected_ratings) != 4:
             continue
-        data_subsets, reversed_labels, is_equal = get_user_type(chosen_ratings, rejected_ratings, augment_type, users)
+        data_subsets, reversed_labels, is_equal = get_user_type(chosen_ratings, rejected_ratings, augment_type)
         if filter_equal:
             reversed_labels = {key: reversed_labels[key] for key in data_subsets if not is_equal[key]}
             data_subsets = [key for key in data_subsets if not is_equal[key]]
