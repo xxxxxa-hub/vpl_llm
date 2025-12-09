@@ -537,13 +537,9 @@ def evaluate_model(
 
 def main():
     # Configuration - adjust these based on your checkpoint
-    # Old: checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    # Old: test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
-
-    # New checkpoint and dataset
-    checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_survey_100/all/vae_gpt2__0_0.0001_cosine_2_0.0_512_768_peft_last_checkpoint"
-    test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_survey_100/gpt2"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/evaluation_results_P_survey_100"
+    checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
+    test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
+    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/evaluation_results"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -552,13 +548,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Setup arguments - matching training script arguments
+    # Setup arguments - matching training script arguments from submit_job_UF_P_4.sh
     script_args = ScriptArguments()
     script_args.max_length = 1024
     script_args.per_device_eval_batch_size = 1
     script_args.fixed_contexts = True  # Use pre-computed context embeddings
     script_args.fixed_llm_embeddings = False  # Compute target embeddings from text via LLM encoder
-    script_args.other_subsets = "84"  # Only use subsets '8' and '4'
+    script_args.other_subsets = "single"  # Use subsets '8', '4', '2', '1' (single = four-user dataset)
     script_args.controversial_only = True  # Only evaluate on controversial examples
 
     # Load checkpoint
