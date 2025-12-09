@@ -37,6 +37,7 @@ class ScriptArguments:
     fixed_llm_embeddings: bool = field(default=False)
     other_subsets: Optional[str] = field(default=None)
     tokenizer_name: Optional[str] = field(default=None)
+    controversial_only: bool = field(default=False)
 
 
 class RewardDataCollatorWithPadding:
@@ -75,6 +76,7 @@ class RewardDataCollatorWithPadding:
             user_mapping = {subset: idx for idx, subset in enumerate(subsets)}
 
         if self.args.fixed_llm_embeddings:
+            # Both target and context embeddings are fixed
             batch_size = len(features)
             embeddings_chosen = []
             embeddings_rejected = []
@@ -108,6 +110,63 @@ class RewardDataCollatorWithPadding:
                 "return_loss": True,
                 "user_type": user_type,
             }
+        elif self.args.fixed_contexts:
+            # Target embeddings computed from text, context embeddings fixed
+            batch_size = len(features)
+            features_chosen = []
+            features_rejected = []
+            contexts_embeddings_chosen = []
+            contexts_embeddings_rejected = []
+            contexts_lengths = [0]
+
+            for feature in features:
+                features_chosen.append({
+                    "input_ids": feature["input_ids_chosen"],
+                    "attention_mask": feature["attention_mask_chosen"],
+                })
+                features_rejected.append({
+                    "input_ids": feature["input_ids_rejected"],
+                    "attention_mask": feature["attention_mask_rejected"],
+                })
+                contexts_embeddings_chosen.extend(
+                    [ctx["embedding_chosen"] for ctx in feature["contexts_embeddings"]]
+                )
+                contexts_embeddings_rejected.extend(
+                    [ctx["embedding_rejected"] for ctx in feature["contexts_embeddings"]]
+                )
+                contexts_lengths.append(len(feature["contexts_embeddings"]))
+
+            # Tokenize padding
+            batch = self.tokenizer.pad(
+                features_chosen + features_rejected,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors=self.return_tensors,
+            )
+
+            input_ids = batch["input_ids"].view(2, batch_size, batch["input_ids"].shape[-1])
+            attention_mask = batch["attention_mask"].view(2, batch_size, batch["attention_mask"].shape[-1])
+
+            context_lengths = torch.cumsum(torch.tensor(contexts_lengths), dim=0)
+            seq_start_end = torch.stack(
+                [context_lengths[:-1], context_lengths[1:]], dim=1
+            )
+            user_type = [user_mapping.get(feature["user_type"], 0) for feature in features]
+            assert len(seq_start_end) == batch_size
+
+            return {
+                "input_ids_chosen": input_ids[0],
+                "attention_mask_chosen": attention_mask[0],
+                "input_ids_rejected": input_ids[1],
+                "attention_mask_rejected": attention_mask[1],
+                "contexts_embeddings_chosen": contexts_embeddings_chosen,
+                "contexts_embeddings_rejected": contexts_embeddings_rejected,
+                "seq_start_end": seq_start_end,
+                "return_loss": True,
+                "user_type": user_type,
+            }
+
         return {}
 
 
@@ -145,31 +204,99 @@ def load_custom_dataset(data_path: str, split: str = "test") -> Dataset:
     return combined_dataset
 
 
-def preprocess_dataset_with_embeddings(dataset: Dataset) -> Dataset:
-    """Preprocess dataset to format embeddings for the model."""
+def preprocess_dataset_matching_training(
+    dataset: Dataset,
+    tokenizer: PreTrainedTokenizerBase,
+    args: ScriptArguments,
+    num_proc: int = 24
+) -> Dataset:
+    """Preprocess dataset to match training configuration."""
+    from vae_utils import VAEModel  # Import here to get access to HHRLHFPreprocessor
 
-    def format_embeddings(example):
-        """Convert embedding lists to tensors."""
-        return {
-            "embedding_chosen": example["embeddings"]["embedding_chosen"],
-            "embedding_rejected": example["embeddings"]["embedding_rejected"],
-            "contexts_embeddings": [
-                {
-                    "embedding_chosen": ctx["embedding_chosen"],
-                    "embedding_rejected": ctx["embedding_rejected"]
+    # Import HHRLHFPreprocessor from training script
+    # We'll define it inline to match the training behavior exactly
+    class EvalHHRLHFPreprocessor:
+        def __init__(self, args, tokenizer, **tokenizer_kwargs):
+            self.tokenizer = tokenizer
+            self.args = args
+            self.tokenizer_kwargs = tokenizer_kwargs
+
+        def __call__(self, examples):
+            if self.args.fixed_llm_embeddings:
+                # Fixed embeddings mode
+                new_examples = {
+                    "embedding_chosen": [],
+                    "embedding_rejected": [],
+                    "contexts_embeddings": [],
+                    "max_lengths": []
                 }
-                for ctx in example["contexts"]
-            ],
-            "max_lengths": 0,  # Placeholder
-            "data_subset": example["data_subset"],
-        }
+                for embeddings, contexts in zip(
+                    examples["embeddings"], examples["contexts"]
+                ):
+                    new_examples["embedding_chosen"].append(embeddings["embedding_chosen"])
+                    new_examples["embedding_rejected"].append(embeddings["embedding_rejected"])
+                    contexts_embeddings = [
+                        {
+                            "embedding_chosen": context["embedding_chosen"],
+                            "embedding_rejected": context["embedding_rejected"]
+                        }
+                        for context in contexts
+                    ]
+                    new_examples["contexts_embeddings"].append(contexts_embeddings)
+                    new_examples["max_lengths"].append(0)
+                new_examples["user_type"] = examples["data_subset"]
+                return new_examples
+            else:
+                # Tokenize chosen/rejected but use pre-computed context embeddings
+                new_examples = {
+                    "input_ids_chosen": [],
+                    "attention_mask_chosen": [],
+                    "input_ids_rejected": [],
+                    "attention_mask_rejected": [],
+                    "contexts_embeddings": [],
+                    "max_lengths": []
+                }
+                for chosen, rejected, contexts, user_type in zip(
+                    examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
+                ):
+                    max_length = 0
+                    tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                    tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
 
-    # Apply the formatting
+                    new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+                    new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+                    new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+                    new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+
+                    max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+                    max_length = max(max_length, len(tokenized_rejected["input_ids"]))
+
+                    # Use pre-computed context embeddings
+                    contexts_embeddings = [
+                        {
+                            "embedding_chosen": context["embedding_chosen"],
+                            "embedding_rejected": context["embedding_rejected"]
+                        }
+                        for context in contexts
+                    ]
+                    new_examples["contexts_embeddings"].append(contexts_embeddings)
+                    new_examples["max_lengths"].append(max_length)
+
+                new_examples["user_type"] = examples["data_subset"]
+                return new_examples
+
+    original_columns = dataset.column_names
+
+    # Apply preprocessor
     dataset = dataset.map(
-        format_embeddings,
-        remove_columns=[col for col in dataset.column_names
-                       if col not in ["data_subset"]],
+        EvalHHRLHFPreprocessor(args, tokenizer, truncation=True, max_length=args.max_length),
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=original_columns,
     )
+
+    # Filter by max length
+    dataset = dataset.filter(lambda x: x["max_lengths"] <= args.max_length)
 
     return dataset
 
@@ -202,8 +329,14 @@ def load_checkpoint(
 
     if os.path.exists(adapter_config_path) and os.path.exists(adapter_model_path):
         print("Loading PEFT adapters from checkpoint...")
-        llm_encoder = PeftModel.from_pretrained(llm_encoder, checkpoint_path)
-        contexts_model = PeftModel.from_pretrained(contexts_model, checkpoint_path)
+        try:
+            llm_encoder = PeftModel.from_pretrained(llm_encoder, checkpoint_path)
+            llm_encoder.eval()  # Set to eval mode immediately
+            contexts_model = PeftModel.from_pretrained(contexts_model, checkpoint_path)
+            contexts_model.eval()  # Set to eval mode immediately
+        except Exception as e:
+            print(f"Warning: Error loading PEFT adapters: {e}")
+            print("Continuing with base models...")
     else:
         # If no adapters, apply PEFT config
         print("No PEFT adapters found. Using base models.")
@@ -220,6 +353,10 @@ def load_checkpoint(
     if os.path.exists(model_pt_path):
         print(f"Loading VAE model from {model_pt_path}")
         vae_model = torch.load(model_pt_path, map_location='cpu', weights_only=False)
+
+        # Update the VAE model's internal encoders with the ones that have PEFT adapters
+        vae_model.llm_encoder = llm_encoder
+        vae_model.llm_contexts_encoder = contexts_model
     else:
         # Create VAE model from scratch if model.pt doesn't exist
         print(f"Warning: model.pt not found at {model_pt_path}")
@@ -275,28 +412,65 @@ def evaluate_model(
                 else:
                     batch_on_device[k] = v
 
-            # Forward pass through the model
+            # Forward pass through the model (matching training code structure)
             try:
-                embeddings_chosen = torch.stack([torch.tensor(e, dtype=torch.bfloat16) for e in batch_on_device["embeddings_chosen"]]).to(device)
-                embeddings_rejected = torch.stack([torch.tensor(e, dtype=torch.bfloat16) for e in batch_on_device["embeddings_rejected"]]).to(device)
-
-                # Stack context embeddings
-                contexts_embeddings_chosen = torch.stack([torch.tensor(e, dtype=torch.bfloat16) for e in batch_on_device["contexts_embeddings_chosen"]]).to(device)
-                contexts_embeddings_rejected = torch.stack([torch.tensor(e, dtype=torch.bfloat16) for e in batch_on_device["contexts_embeddings_rejected"]]).to(device)
-
                 seq_start_end = batch_on_device["seq_start_end"].to(device)
-                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.bfloat16).to(device)
+                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.float32).to(device)
 
-                # Forward pass through VAE model
+                # Handle fixed_llm_embeddings case
+                if model.fixed_llm_embeddings:
+                    # Pre-computed target embeddings
+                    embeddings_chosen = torch.tensor(batch_on_device["embeddings_chosen"], dtype=torch.bfloat16).to(device)
+                    embeddings_rejected = torch.tensor(batch_on_device["embeddings_rejected"], dtype=torch.bfloat16).to(device)
+                else:
+                    # Compute embeddings from tokenized inputs
+                    output = model.llm_encoder(
+                        input_ids=torch.concatenate([
+                            batch_on_device["input_ids_chosen"],
+                            batch_on_device["input_ids_rejected"],
+                        ], dim=0),
+                        attention_mask=torch.concatenate([
+                            batch_on_device["attention_mask_chosen"],
+                            batch_on_device["attention_mask_rejected"],
+                        ], dim=0),
+                    )
+                    embeddings = output[0]
+                    batch_size = batch_on_device["seq_start_end"].shape[0]
+                    embeddings_chosen = embeddings[:batch_size]
+                    embeddings_rejected = embeddings[batch_size:]
+
+                # Stack context embeddings into tensors
+                contexts_embeddings_chosen = torch.tensor(batch_on_device["contexts_embeddings_chosen"], dtype=torch.bfloat16).to(device)
+                contexts_embeddings_rejected = torch.tensor(batch_on_device["contexts_embeddings_rejected"], dtype=torch.bfloat16).to(device)
+
+                # Debug: Print shapes and sample values on first batch
+                if batch_idx == 0:
+                    print(f"\n  Debug Info (Batch 0):")
+                    print(f"    embeddings_chosen shape: {embeddings_chosen.shape}, mean: {embeddings_chosen.mean():.4f}, std: {embeddings_chosen.std():.4f}")
+                    print(f"    embeddings_rejected shape: {embeddings_rejected.shape}, mean: {embeddings_rejected.mean():.4f}, std: {embeddings_rejected.std():.4f}")
+                    print(f"    contexts_chosen shape: {contexts_embeddings_chosen.shape}")
+                    print(f"    contexts_rejected shape: {contexts_embeddings_rejected.shape}")
+                    print(f"    seq_start_end: {seq_start_end}")
+                    print(f"    embeddings_chosen vs rejected difference (norm): {(embeddings_chosen - embeddings_rejected).norm():.6f}")
+
+                # Forward pass through VAE model (using positional args like training code)
                 rewards_chosen, rewards_rejected, mean, log_var, z = model(
-                    target_chosen=embeddings_chosen,
-                    target_rejected=embeddings_rejected,
-                    context_chosen=contexts_embeddings_chosen,
-                    context_rejected=contexts_embeddings_rejected,
-                    seq_start_end=seq_start_end,
-                    user_type=user_type_batch,
-                    ground_truth_user_vector=False,
+                    embeddings_chosen,
+                    embeddings_rejected,
+                    contexts_embeddings_chosen,
+                    contexts_embeddings_rejected,
+                    seq_start_end,
+                    user_type_batch,
+                    False,  # ground_truth_user_vector
                 )
+
+                # Debug: Print reward statistics
+                if batch_idx == 0:
+                    print(f"    rewards_chosen: {rewards_chosen.flatten()[:5]}, mean: {rewards_chosen.mean():.4f}")
+                    print(f"    rewards_rejected: {rewards_rejected.flatten()[:5]}, mean: {rewards_rejected.mean():.4f}")
+                    print(f"    mean (user vector): norm={mean.norm():.4f}, values={mean[0, :3]}")
+                    print(f"    z (sampled user vector): norm={z.norm():.4f}, values={z[0, :3]}")
+                    print()
             except Exception as e:
                 print(f"Error processing batch {batch_idx}: {e}")
                 import traceback
@@ -363,9 +537,13 @@ def evaluate_model(
 
 def main():
     # Configuration - adjust these based on your checkpoint
-    checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/evaluation_results"
+    # Old: checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
+    # Old: test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
+
+    # New checkpoint and dataset
+    checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_survey_100/all/vae_gpt2__0_0.0001_cosine_2_0.0_512_768_peft_last_checkpoint"
+    test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_survey_100/gpt2"
+    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/evaluation_results_P_survey_100"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -374,12 +552,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Setup arguments - using fixed embeddings since data has pre-computed embeddings
+    # Setup arguments - matching training script arguments
     script_args = ScriptArguments()
     script_args.max_length = 1024
     script_args.per_device_eval_batch_size = 1
-    script_args.fixed_contexts = True
-    script_args.fixed_llm_embeddings = True
+    script_args.fixed_contexts = True  # Use pre-computed context embeddings
+    script_args.fixed_llm_embeddings = False  # Compute target embeddings from text via LLM encoder
+    script_args.other_subsets = "84"  # Only use subsets '8' and '4'
+    script_args.controversial_only = True  # Only evaluate on controversial examples
 
     # Load checkpoint
     print("\n=== Loading Checkpoint ===")
@@ -397,9 +577,15 @@ def main():
     test_dataset = load_custom_dataset(test_data_path, split="test")
     print(f"Loaded {len(test_dataset)} test samples")
 
-    # Preprocess dataset with embeddings
+    # Filter for controversial only (matching training script)
+    if script_args.controversial_only:
+        print("\n=== Filtering to Controversial Examples ===")
+        test_dataset = test_dataset.filter(lambda example: example.get('controversial', False) == True)
+        print(f"After filtering to controversial: {len(test_dataset)} samples")
+
+    # Preprocess dataset matching training configuration
     print("\n=== Preprocessing Dataset ===")
-    test_dataset = preprocess_dataset_with_embeddings(test_dataset)
+    test_dataset = preprocess_dataset_matching_training(test_dataset, tokenizer, script_args)
     print(f"After preprocessing: {len(test_dataset)} samples")
 
     # Create data loader
