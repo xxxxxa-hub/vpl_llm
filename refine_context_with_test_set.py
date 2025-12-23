@@ -140,6 +140,10 @@ def load_best_context(context_optimization_dir: str):
     with open(best_context_path, 'rb') as f:
         best_context = pickle.load(f)
 
+    # Mark all initial contexts as true preferences (not synthesized)
+    for ctx in best_context:
+        ctx["is_true_preference"] = True
+
     return best_context
 
 
@@ -152,13 +156,16 @@ def create_augmented_test_set(test_data: List[Dict]) -> List[Dict]:
     augmented_data = []
 
     for item in test_data:
-        # Original
-        augmented_data.append(item)
+        # Original - mark as true preference
+        original_item = deepcopy(item)
+        original_item["is_true_preference"] = True
+        augmented_data.append(original_item)
 
-        # Reversed: swap chosen and rejected
+        # Reversed: swap chosen and rejected - mark as synthesized
         reversed_item = deepcopy(item)
         reversed_item["chosen"] = item["rejected"]
         reversed_item["rejected"] = item["chosen"]
+        reversed_item["is_true_preference"] = False
 
         # Swap embeddings if they exist
         if "embeddings" in item:
@@ -559,16 +566,30 @@ def main():
                 best_sample_idx = sample_idx
 
         # Log best result for this position
+        best_sample_is_true_pref = None
+        best_sample_index = None
+        best_sample_original_id = None
+        if best_sample_idx >= 0 and best_sample_idx < len(augmented_test_data):
+            best_sample = augmented_test_data[best_sample_idx]
+            best_sample_is_true_pref = best_sample.get("is_true_preference", None)
+            best_sample_index = best_sample.get("Index", None)
+            best_sample_original_id = best_sample.get("original_id", None)
+
         result = {
             "iteration": iteration,
-            "sample_idx": best_sample_idx,
+            "selected_sample": {
+                "augmented_test_data_idx": best_sample_idx,
+                "Index": best_sample_index,
+                "original_id": best_sample_original_id,
+                "is_true_preference": best_sample_is_true_pref
+            },
             "replace_pos": replace_pos,
             "old_snr": best_snr,
             "new_snr": best_snr_for_pos,
             "old_accuracy": best_accuracy,
             "new_accuracy": best_acc_for_pos,
             "accepted": best_snr_for_pos > best_snr,
-            "context_indices": [ctx["Index"] for ctx in best_candidate_for_pos] if best_candidate_for_pos else [ctx["Index"] for ctx in current_context],
+            "context_Index_list": [ctx["Index"] for ctx in best_candidate_for_pos] if best_candidate_for_pos else [ctx["Index"] for ctx in current_context],
             "num_candidates_tried": len(sampled_indices)
         }
         search_history.append(result)
@@ -601,6 +622,11 @@ def main():
     with open(best_context_path, 'w') as f:
         json.dump([{k: v for k, v in item.items() if k != "embeddings"} for item in best_context], f, indent=2)
     print(f"Best refined context saved to {best_context_path}")
+
+    # Log preference type breakdown
+    true_pref_count = sum(1 for ctx in best_context if ctx.get("is_true_preference", False))
+    synth_pref_count = sum(1 for ctx in best_context if not ctx.get("is_true_preference", True))
+    print(f"Final context composition: {true_pref_count} true preferences, {synth_pref_count} synthesized preferences")
 
     # Save best context with embeddings
     best_context_full_path = os.path.join(output_dir, "refined_context_with_embeddings.pkl")
