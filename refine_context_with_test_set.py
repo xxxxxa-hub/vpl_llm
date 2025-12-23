@@ -14,6 +14,7 @@ import json
 import pickle
 import torch
 import numpy as np
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from dataclasses import dataclass, field
@@ -432,15 +433,27 @@ def load_checkpoint(
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Refine context using test set examples")
+    parser.add_argument(
+        "--subset",
+        type=str,
+        default="8",
+        choices=["1", "2", "4", "8"],
+        help="Data subset to refine context for: '1', '2', '4', or '8'. Default: 8"
+    )
+    cmd_args = parser.parse_args()
+
     # Configuration
+    data_subset = cmd_args.subset
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    context_optimization_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_optimization"
-    test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2/8/test.jsonl"
-    survey_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4/8/survey_100.jsonl"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_refinement"
+    context_optimization_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}"
+    test_data_path = f"/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2/{data_subset}/test.jsonl"
+    survey_path = f"/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4/{data_subset}/survey_100.jsonl"
+    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_refinement_subset_{data_subset}"
 
     # Search parameters
-    num_iterations = 5
+    num_iterations = 8
     context_length = 8
     num_proc = 24  # Number of processes for parallel preprocessing (increase for faster preprocessing)
 
@@ -448,6 +461,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Using device: {device}")
+    print(f"Data subset: {data_subset}")
     print(f"Number of iterations: {num_iterations}")
     print(f"Context length: {context_length}")
     print(f"Parallel preprocessing: {num_proc} processes")
@@ -498,8 +512,8 @@ def main():
 
     # Split survey data into demo and validation (same as optimize_context.py)
     # demo_size=10, validation_size=50 (indices 10:60)
-    demo_size = 10
-    validation_size = 10
+    demo_size = 20
+    validation_size = 20
     random.seed(0)
     shuffled_data = survey_data.copy()
     random.shuffle(shuffled_data)
@@ -507,7 +521,7 @@ def main():
 
     # Add data_subset field
     for item in validation_data:
-        item["data_subset"] = "8"
+        item["data_subset"] = data_subset
 
     print(f"Validation set size: {len(validation_data)}")
 

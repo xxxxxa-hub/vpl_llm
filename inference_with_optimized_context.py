@@ -504,25 +504,32 @@ def main():
         default="initial",
         help="Which context to use: 'initial' (optimization) or 'refined' (after refinement). Default: initial"
     )
+    parser.add_argument(
+        "--subset",
+        type=str,
+        default="8",
+        choices=["1", "2", "4", "8", "single", "84"],
+        help="Data subset to evaluate: '8', '4', '2', '1', 'single' (8,4,2,1), or '84' (8,4). Default: 8"
+    )
     args = parser.parse_args()
 
     # Configuration - using optimized context
+    data_subset = args.subset
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
     test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
-    context_optimization_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_optimization"
-    context_refinement_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_refinement"
-    data_subset = "8"  # Only working with subset '8'
+    context_optimization_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}"
+    context_refinement_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_refinement_subset_{data_subset}"
 
     # Determine which context to use and output directory
     if args.context == "refined":
         context_source_dir = context_refinement_dir
         context_file = "refined_context_with_embeddings.pkl"
-        output_dir = "/hpc/group/fanglab/xx102/vpl_llm/inference_results_refined_context"
+        output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/inference_results_refined_context_subset_{data_subset}"
         context_label = "REFINED"
     else:
         context_source_dir = context_optimization_dir
         context_file = "best_context_with_embeddings.pkl"
-        output_dir = "/hpc/group/fanglab/xx102/vpl_llm/inference_results_optimized_context"
+        output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/inference_results_optimized_context_subset_{data_subset}"
         context_label = "INITIAL (OPTIMIZED)"
 
     # Create output directory

@@ -14,6 +14,7 @@ import os
 import json
 import torch
 import numpy as np
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from dataclasses import dataclass, field
@@ -487,17 +488,28 @@ def save_jsonl(data: List[Dict], output_path: str):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Optimize context selection for VAE preference model")
+    parser.add_argument(
+        "--subset",
+        type=str,
+        default="8",
+        choices=["1", "2", "4", "8"],
+        help="Data subset to optimize context for: '1', '2', '4', or '8'. Default: 8"
+    )
+    cmd_args = parser.parse_args()
+
     # Configuration
-    survey_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4/8/survey_100.jsonl"
+    data_subset = cmd_args.subset
+    survey_path = f"/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4/{data_subset}/survey_100.jsonl"
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_optimization"
+    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}"
 
     # Fixed parameters
     context_length = 8
-    num_candidates = 20
-    demo_size = 10  # Small demo set for bootstrapping contexts
-    validation_size = 10  # Larger validation set for reliable evaluation
-    data_subset = "8"  # Only working with subset '8'
+    num_candidates = 50
+    demo_size = 20  # Small demo set for bootstrapping contexts
+    validation_size = 20  # Larger validation set for reliable evaluation
 
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"

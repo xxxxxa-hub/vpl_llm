@@ -6,6 +6,7 @@ import os
 import json
 import torch
 import numpy as np
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any
 from dataclasses import dataclass, field
@@ -552,10 +553,21 @@ def evaluate_model(
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Evaluate VAE preference model on test data")
+    parser.add_argument(
+        "--subset",
+        type=str,
+        default="8",
+        choices=["1", "2", "4", "8", "single", "84"],
+        help="Data subset to evaluate: '8', '4', '2', '1', 'single' (8,4,2,1), or '84' (8,4). Default: 8"
+    )
+    args = parser.parse_args()
+
     # Configuration - adjust these based on your checkpoint
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
     test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/evaluation_results"
+    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/evaluation_results_subset_{args.subset}"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -563,6 +575,7 @@ def main():
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Evaluating subset: {args.subset}")
 
     # Setup arguments - matching training script arguments from submit_job_UF_P_4.sh
     script_args = ScriptArguments()
@@ -570,7 +583,7 @@ def main():
     script_args.per_device_eval_batch_size = 1
     script_args.fixed_contexts = True  # Use pre-computed context embeddings
     script_args.fixed_llm_embeddings = False  # Compute target embeddings from text via LLM encoder
-    script_args.other_subsets = "8"  # Use subsets '8', '4', '2', '1' (single = four-user dataset)
+    script_args.other_subsets = args.subset  # Use specified subset
     script_args.controversial_only = True  # Only evaluate on controversial examples
 
     # Load checkpoint
