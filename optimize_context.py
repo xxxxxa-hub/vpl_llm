@@ -3,7 +3,7 @@
 Script to optimize context selection for VAE preference model.
 
 This script:
-1. Splits survey_100.jsonl into 50 demo and 50 validation samples
+1. Splits survey_100.jsonl into 10 demo and 50 validation samples
 2. Bootstraps multiple candidate context sets from demo
 3. Evaluates each candidate on validation set using VAE model
 4. Selects the best performing context
@@ -172,8 +172,15 @@ def load_survey_data(survey_path: str) -> List[Dict]:
     return data
 
 
-def split_survey_data(survey_data: List[Dict], demo_size: int = 50, seed: int = 42) -> Tuple[List[Dict], List[Dict]]:
-    """Split survey data into demo and validation sets."""
+def split_survey_data(survey_data: List[Dict], demo_size: int = 10, validation_size: int = 50, seed: int = 0) -> Tuple[List[Dict], List[Dict]]:
+    """Split survey data into demo and validation sets.
+
+    Args:
+        survey_data: Full survey dataset
+        demo_size: Number of demo examples (default: 10)
+        validation_size: Number of validation examples (default: 50)
+        seed: Random seed for reproducibility
+    """
     random.seed(seed)
     np.random.seed(seed)
 
@@ -181,7 +188,7 @@ def split_survey_data(survey_data: List[Dict], demo_size: int = 50, seed: int = 
     random.shuffle(shuffled_data)
 
     demo_data = shuffled_data[:demo_size]
-    validation_data = shuffled_data[demo_size:demo_size * 2]
+    validation_data = shuffled_data[demo_size:demo_size + validation_size]
 
     return demo_data, validation_data
 
@@ -193,6 +200,7 @@ def create_candidate_contexts(demo_data: List[Dict], num_candidates: int = 5, co
 
     for i in range(num_candidates):
         # Randomly sample context_length items from demo_data
+        print(f"Bootstrapping context {i}")
         context = random.sample(demo_data, min(context_length, len(demo_data)))
         candidates.append(context)
 
@@ -459,7 +467,8 @@ def main():
     # Fixed parameters
     context_length = 8
     num_candidates = 20
-    demo_size = 50
+    demo_size = 10  # Small demo set for bootstrapping contexts
+    validation_size = 10  # Larger validation set for reliable evaluation
     data_subset = "8"  # Only working with subset '8'
 
     os.makedirs(output_dir, exist_ok=True)
@@ -485,7 +494,7 @@ def main():
 
     # Split data
     print("\n=== Splitting Survey Data ===")
-    demo_data, validation_data = split_survey_data(survey_data, demo_size=demo_size)
+    demo_data, validation_data = split_survey_data(survey_data, demo_size=demo_size, validation_size=validation_size)
     print(f"Demo samples: {len(demo_data)}")
     print(f"Validation samples: {len(validation_data)}")
 
