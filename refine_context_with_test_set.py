@@ -254,8 +254,15 @@ def evaluate_context(
     tokenizer: PreTrainedTokenizerBase,
     args: ScriptArguments,
     device: str = "cuda",
-) -> float:
-    """Evaluate a context set on validation dataset and return accuracy."""
+) -> tuple:
+    """Evaluate a context set on validation dataset and return accuracy and SNR.
+
+    SNR is computed as:
+    SNR = mean(log P(true|chosen)) / std(log P(true|chosen))
+
+    where log P(true|x) = log_sigmoid(reward_score)
+    Measures how consistently high the model rates chosen responses.
+    """
 
     data_collator = RewardDataCollatorWithPadding(
         args=args,
@@ -275,6 +282,8 @@ def evaluate_context(
     model.eval()
 
     accuracies = []
+    log_probs_chosen = []
+    log_probs_rejected = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -320,6 +329,13 @@ def evaluate_context(
                     False,
                 )
 
+                # Compute log P(true|x) = log_sigmoid(reward) for both chosen and rejected
+                log_prob_chosen = torch.nn.functional.logsigmoid(rewards_chosen).float().cpu().numpy().flatten()
+                log_prob_rejected = torch.nn.functional.logsigmoid(rewards_rejected).float().cpu().numpy().flatten()
+
+                log_probs_chosen.extend(log_prob_chosen)
+                log_probs_rejected.extend(log_prob_rejected)
+
                 accuracy = (rewards_chosen > rewards_rejected).float().mean().item()
                 accuracies.append(accuracy)
 
@@ -328,7 +344,19 @@ def evaluate_context(
                 continue
 
     avg_accuracy = np.mean(accuracies) if accuracies else 0.0
-    return float(avg_accuracy)
+
+    # Compute SNR
+    log_probs_chosen = np.array(log_probs_chosen)
+    log_probs_rejected = np.array(log_probs_rejected)
+
+    mean_chosen = np.mean(log_probs_chosen)
+    std_chosen = np.std(log_probs_chosen)
+
+    # SNR = signal_strength / signal_variance
+    # Measures how consistently high the model rates chosen responses
+    snr = mean_chosen / (std_chosen + 1e-8)  # Add small epsilon to avoid division by zero
+
+    return float(avg_accuracy), float(snr)
 
 
 def load_checkpoint(
@@ -479,14 +507,15 @@ def main():
     # Evaluate initial context
     print("\n=== Evaluating Initial Context ===")
     val_dataset = preprocess_validation_dataset(validation_data, tokenizer, script_args, current_context, num_proc=num_proc)
-    initial_accuracy = evaluate_context(vae_model, val_dataset, tokenizer, script_args, device)
-    print(f"Initial context accuracy: {initial_accuracy:.6f}")
+    initial_accuracy, initial_snr = evaluate_context(vae_model, val_dataset, tokenizer, script_args, device)
+    print(f"Initial context - Accuracy: {initial_accuracy:.6f}, SNR: {initial_snr:.6f}")
 
     # Iterative search
     print("\n=== Starting Iterative Search ===")
     search_history = []
     best_context = deepcopy(current_context)
     best_accuracy = initial_accuracy
+    best_snr = initial_snr
 
     # Systematic hill-climbing: cycle through positions with local search
     # For each position, sample multiple candidates and pick the best one
@@ -500,10 +529,11 @@ def main():
         sampled_indices = random.sample(range(len(augmented_test_data)), min(num_candidates_per_pos, len(augmented_test_data)))
 
         best_candidate_for_pos = None
+        best_snr_for_pos = best_snr
         best_acc_for_pos = best_accuracy
         best_sample_idx = -1
 
-        print(f"Iteration {iteration}: Position {replace_pos} (best so far: {best_accuracy:.6f})")
+        print(f"Iteration {iteration}: Position {replace_pos} (best SNR so far: {best_snr:.6f})")
 
         # Evaluate all candidates for this position
         for candidate_idx, sample_idx in enumerate(sampled_indices, 1):
@@ -515,14 +545,15 @@ def main():
 
             # Evaluate new context
             val_dataset = preprocess_validation_dataset(validation_data, tokenizer, script_args, candidate_context, num_proc=num_proc)
-            new_accuracy = evaluate_context(vae_model, val_dataset, tokenizer, script_args, device)
+            new_accuracy, new_snr = evaluate_context(vae_model, val_dataset, tokenizer, script_args, device)
 
-            # Print accuracy for each evaluation
-            is_best_for_pos = "★" if new_accuracy > best_acc_for_pos else " "
-            print(f"  [{candidate_idx}/{len(sampled_indices)}] test_idx={sample_idx}: {new_accuracy:.6f} {is_best_for_pos}")
+            # Print SNR and accuracy for each evaluation
+            is_best_for_pos = "★" if new_snr > best_snr_for_pos else " "
+            print(f"  [{candidate_idx}/{len(sampled_indices)}] test_idx={sample_idx}: SNR={new_snr:.6f} Acc={new_accuracy:.6f} {is_best_for_pos}")
 
-            # Track best candidate for this position
-            if new_accuracy > best_acc_for_pos:
+            # Track best candidate for this position (using SNR)
+            if new_snr > best_snr_for_pos:
+                best_snr_for_pos = new_snr
                 best_acc_for_pos = new_accuracy
                 best_candidate_for_pos = candidate_context
                 best_sample_idx = sample_idx
@@ -532,25 +563,29 @@ def main():
             "iteration": iteration,
             "sample_idx": best_sample_idx,
             "replace_pos": replace_pos,
+            "old_snr": best_snr,
+            "new_snr": best_snr_for_pos,
             "old_accuracy": best_accuracy,
             "new_accuracy": best_acc_for_pos,
-            "accepted": best_acc_for_pos > best_accuracy,
+            "accepted": best_snr_for_pos > best_snr,
             "context_indices": [ctx["Index"] for ctx in best_candidate_for_pos] if best_candidate_for_pos else [ctx["Index"] for ctx in current_context],
             "num_candidates_tried": len(sampled_indices)
         }
         search_history.append(result)
 
-        # Accept if improved
-        if best_candidate_for_pos is not None and best_acc_for_pos > best_accuracy:
-            improvement = best_acc_for_pos - best_accuracy
-            print(f"\n✓ Iteration {iteration}: IMPROVED {best_accuracy:.6f} -> {best_acc_for_pos:.6f} (+{improvement:.6f})")
+        # Accept if improved (using SNR)
+        if best_candidate_for_pos is not None and best_snr_for_pos > best_snr:
+            snr_improvement = best_snr_for_pos - best_snr
+            print(f"\n✓ Iteration {iteration}: IMPROVED SNR {best_snr:.6f} -> {best_snr_for_pos:.6f} (+{snr_improvement:.6f})")
             print(f"  Position {replace_pos}: best of {len(sampled_indices)} samples was test_idx={best_sample_idx}")
+            print(f"  Accuracy: {best_accuracy:.6f} -> {best_acc_for_pos:.6f}")
+            best_snr = best_snr_for_pos
             best_accuracy = best_acc_for_pos
             best_context = best_candidate_for_pos
             current_context = best_candidate_for_pos
-            pbar.set_postfix({"Best Accuracy": f"{best_accuracy:.6f}", "Improvements": sum(1 for r in search_history if r["accepted"])})
+            pbar.set_postfix({"Best SNR": f"{best_snr:.6f}", "Improvements": sum(1 for r in search_history if r["accepted"])})
         else:
-            pbar.set_postfix({"Best Accuracy": f"{best_accuracy:.6f}", "Improvements": sum(1 for r in search_history if r["accepted"])})
+            pbar.set_postfix({"Best SNR": f"{best_snr:.6f}", "Improvements": sum(1 for r in search_history if r["accepted"])})
 
     # Save results
     print("\n=== Saving Results ===")
@@ -575,9 +610,12 @@ def main():
 
     # Save summary
     summary = {
+        "initial_snr": initial_snr,
+        "final_snr": best_snr,
+        "snr_improvement": best_snr - initial_snr,
         "initial_accuracy": initial_accuracy,
         "final_accuracy": best_accuracy,
-        "improvement": best_accuracy - initial_accuracy,
+        "accuracy_improvement": best_accuracy - initial_accuracy,
         "num_iterations": num_iterations,
         "total_accepted": sum(1 for r in search_history if r["accepted"]),
         "best_context_indices": [ctx["Index"] for ctx in best_context]
@@ -590,9 +628,12 @@ def main():
     print("\n" + "=" * 70)
     print("✓ Context refinement complete!")
     print("=" * 70)
+    print(f"\nInitial SNR:     {initial_snr:.6f}")
+    print(f"Final SNR:       {best_snr:.6f}")
+    print(f"SNR Improvement: {best_snr - initial_snr:.6f}")
     print(f"\nInitial accuracy: {initial_accuracy:.6f}")
     print(f"Final accuracy:  {best_accuracy:.6f}")
-    print(f"Improvement:     {best_accuracy - initial_accuracy:.6f}")
+    print(f"Accuracy improvement: {best_accuracy - initial_accuracy:.6f}")
     print(f"Iterations with improvement: {sum(1 for r in search_history if r['accepted'])}/{num_iterations}")
     print(f"\nOutput directory: {output_dir}")
     print(f"\nTo use this refined context for inference:")

@@ -349,8 +349,15 @@ def evaluate_context(
     tokenizer: PreTrainedTokenizerBase,
     args: ScriptArguments,
     device: str = "cuda",
-) -> float:
-    """Evaluate a context set on validation dataset and return accuracy."""
+) -> tuple:
+    """Evaluate a context set on validation dataset and return accuracy and SNR.
+
+    SNR is computed as:
+    SNR = mean(log P(true|chosen)) / std(log P(true|chosen))
+
+    where log P(true|x) = log_sigmoid(reward_score)
+    Measures how consistently high the model rates chosen responses.
+    """
 
     data_collator = RewardDataCollatorWithPadding(
         args=args,
@@ -370,6 +377,8 @@ def evaluate_context(
     model.eval()
 
     accuracies = []
+    log_probs_chosen = []
+    log_probs_rejected = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -415,6 +424,13 @@ def evaluate_context(
                     False,
                 )
 
+                # Compute log P(true|x) = log_sigmoid(reward) for both chosen and rejected
+                log_prob_chosen = torch.nn.functional.logsigmoid(rewards_chosen).float().cpu().numpy().flatten()
+                log_prob_rejected = torch.nn.functional.logsigmoid(rewards_rejected).float().cpu().numpy().flatten()
+
+                log_probs_chosen.extend(log_prob_chosen)
+                log_probs_rejected.extend(log_prob_rejected)
+
                 accuracy = (rewards_chosen > rewards_rejected).float().mean().item()
                 accuracies.append(accuracy)
 
@@ -423,7 +439,19 @@ def evaluate_context(
                 continue
 
     avg_accuracy = np.mean(accuracies) if accuracies else 0.0
-    return float(avg_accuracy)
+
+    # Compute SNR
+    log_probs_chosen = np.array(log_probs_chosen)
+    log_probs_rejected = np.array(log_probs_rejected)
+
+    mean_chosen = np.mean(log_probs_chosen)
+    std_chosen = np.std(log_probs_chosen)
+
+    # SNR = signal_strength / signal_variance
+    # Measures how consistently high the model rates chosen responses
+    snr = mean_chosen / (std_chosen + 1e-8)  # Add small epsilon to avoid division by zero
+
+    return float(avg_accuracy), float(snr)
 
 
 def apply_context_to_dataset(dataset_data: List[Dict], context: List[Dict], context_length: int = 8) -> List[Dict]:
@@ -529,20 +557,29 @@ def main():
         print(f"  Preprocessed validation set: {len(val_dataset)} samples")
 
         # Evaluate
-        accuracy = evaluate_context(vae_model, val_dataset, tokenizer, args, device)
+        accuracy, snr = evaluate_context(vae_model, val_dataset, tokenizer, args, device)
         print(f"  Accuracy: {accuracy:.6f}")
+        print(f"  SNR: {snr:.6f}")
 
         results.append({
             "candidate_idx": candidate_idx,
             "accuracy": accuracy,
+            "snr": snr,
             "context_indices": [ctx["Index"] for ctx in candidate_context],
         })
 
-    # Find best candidate
+    # Find best candidate by SNR
     print("\n=== Results ===")
-    best_result = max(results, key=lambda x: x["accuracy"])
-    print(f"Best candidate: {best_result['candidate_idx']} with accuracy {best_result['accuracy']:.6f}")
-    print(f"Context indices: {best_result['context_indices']}")
+    best_result = max(results, key=lambda x: x["snr"])
+    print(f"Best candidate: {best_result['candidate_idx']}")
+    print(f"  Accuracy: {best_result['accuracy']:.6f}")
+    print(f"  SNR: {best_result['snr']:.6f}")
+    print(f"  Context indices: {best_result['context_indices']}")
+
+    # Print all results for comparison
+    print("\n=== All Results (sorted by SNR) ===")
+    for result in sorted(results, key=lambda x: x["snr"], reverse=True):
+        print(f"Candidate {result['candidate_idx']:2d}: SNR={result['snr']:8.4f}, Accuracy={result['accuracy']:8.4f}")
 
     # Save results
     results_path = os.path.join(output_dir, "optimization_results.json")
@@ -565,6 +602,7 @@ def main():
     print(f"Best context with embeddings saved to {best_context_full_path}")
 
     print("\n✓ Context optimization complete!")
+    print(f"Best SNR: {best_result['snr']:.6f}")
     print(f"Best accuracy: {best_result['accuracy']:.6f}")
     print(f"Best candidate index: {best_result['candidate_idx']}")
     print(f"Output directory: {output_dir}")
