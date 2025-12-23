@@ -71,6 +71,8 @@ class RewardDataCollatorWithPadding:
                 subsets = ['helpfulness', 'honesty', 'instruction_following', 'truthfulness']
             elif self.args.other_subsets == 'single' or self.args.other_subsets == '84':
                 subsets = ['8', '4', '2', '1']
+            elif self.args.other_subsets:
+                subsets = [self.args.other_subsets]
             else:
                 subsets = []
             user_mapping = {subset: idx for idx, subset in enumerate(subsets)}
@@ -170,38 +172,52 @@ class RewardDataCollatorWithPadding:
         return {}
 
 
-def load_custom_dataset(data_path: str, split: str = "test") -> Dataset:
-    """Load dataset from custom JSONL files in directory structure."""
-    datasets: List[Dataset] = []
+def load_custom_dataset(data_path: str, split: str = "test", subset = "8") -> Dataset:
+    """Load dataset from custom JSONL files in directory structure.
 
-    # Check if directory structure exists
+    Args:
+        data_path: Path to data directory containing subset subdirectories
+        split: Which split to load (e.g., 'test', 'train')
+        subset: Which subset(s) to load. Can be a string (e.g., '8') or list of strings (e.g., ['8', '4', '2', '1']).
+                Default: '8'
+    """
     base_path = Path(data_path)
 
-    # Get subdirectories that contain test.jsonl files
-    subdirs = sorted([d for d in base_path.glob('*/') if d.is_dir()])
+    # Handle both single subset (string) and multiple subsets (list)
+    if isinstance(subset, str):
+        subsets = [subset]
+    else:
+        subsets = subset
 
-    for subdir in subdirs:
-        split_file = subdir / f"{split}.jsonl"
-        if split_file.exists():
-            print(f"Loading {split_file}")
-            dataset = load_dataset('json', data_files=str(split_file), split=None)
+    datasets = []
 
-            # Map data_subset based on directory name
-            data_subset_name = subdir.name  # Use directory name as subset
-            if isinstance(dataset, dict):
-                # If load_dataset returns a DatasetDict
-                dataset = dataset['train'] if 'train' in dataset else list(dataset.values())[0]
+    for sub in subsets:
+        subset_dir = base_path / sub
+        split_file = subset_dir / f"{split}.jsonl"
 
-            dataset = dataset.map(lambda x: {**x, "data_subset": data_subset_name})
-            datasets.append(dataset)
-            print(f"  Loaded {len(dataset)} examples from {subdir.name}")
+        if not split_file.exists():
+            raise ValueError(f"Dataset file not found: {split_file}")
 
-    if not datasets:
-        raise ValueError(f"No {split}.jsonl files found in {data_path}")
+        print(f"Loading {split_file}")
+        dataset = load_dataset('json', data_files=str(split_file), split=None)
 
-    combined_dataset = concatenate_datasets(datasets)
-    print(f"Total samples loaded: {len(combined_dataset)}")
-    return combined_dataset
+        # Map data_subset based on directory name
+        data_subset_name = subset_dir.name
+        if isinstance(dataset, dict):
+            # If load_dataset returns a DatasetDict
+            dataset = dataset['train'] if 'train' in dataset else list(dataset.values())[0]
+
+        dataset = dataset.map(lambda x: {**x, "data_subset": data_subset_name})
+        print(f"Loaded {len(dataset)} examples from subset {sub}")
+        datasets.append(dataset)
+
+    # Concatenate all datasets if multiple subsets
+    if len(datasets) > 1:
+        combined_dataset = concatenate_datasets(datasets)
+        print(f"Total: {len(combined_dataset)} examples from {len(datasets)} subsets")
+        return combined_dataset
+    else:
+        return datasets[0]
 
 
 def preprocess_dataset_matching_training(
@@ -554,7 +570,7 @@ def main():
     script_args.per_device_eval_batch_size = 1
     script_args.fixed_contexts = True  # Use pre-computed context embeddings
     script_args.fixed_llm_embeddings = False  # Compute target embeddings from text via LLM encoder
-    script_args.other_subsets = "single"  # Use subsets '8', '4', '2', '1' (single = four-user dataset)
+    script_args.other_subsets = "8"  # Use subsets '8', '4', '2', '1' (single = four-user dataset)
     script_args.controversial_only = True  # Only evaluate on controversial examples
 
     # Load checkpoint
@@ -570,7 +586,19 @@ def main():
 
     # Load test data
     print("\n=== Loading Test Data ===")
-    test_dataset = load_custom_dataset(test_data_path, split="test")
+    # Determine which subsets to load based on other_subsets setting
+    if script_args.other_subsets == 'ultra_feedback':
+        subsets = ['helpfulness', 'honesty', 'instruction_following', 'truthfulness']
+    elif script_args.other_subsets == 'single':
+        subsets = ['8', '4', '2', '1']
+    elif script_args.other_subsets == '84':
+        subsets = ['8', '4']
+    elif script_args.other_subsets:
+        subsets = [script_args.other_subsets]
+    else:
+        subsets = ['helpful', 'harmless']
+
+    test_dataset = load_custom_dataset(test_data_path, split="test", subset=subsets)
     print(f"Loaded {len(test_dataset)} test samples")
 
     # Filter for controversial only (matching training script)
