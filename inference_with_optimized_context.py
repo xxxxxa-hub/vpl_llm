@@ -13,6 +13,7 @@ import os
 import json
 import torch
 import numpy as np
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any
 from dataclasses import dataclass, field
@@ -494,12 +495,35 @@ def run_inference(
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Run inference with optimized or refined context")
+    parser.add_argument(
+        "--context",
+        type=str,
+        choices=["initial", "refined"],
+        default="initial",
+        help="Which context to use: 'initial' (optimization) or 'refined' (after refinement). Default: initial"
+    )
+    args = parser.parse_args()
+
     # Configuration - using optimized context
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
     test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
     context_optimization_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_optimization"
-    output_dir = "/hpc/group/fanglab/xx102/vpl_llm/inference_results_optimized_context"
+    context_refinement_dir = "/hpc/group/fanglab/xx102/vpl_llm/context_refinement"
     data_subset = "8"  # Only working with subset '8'
+
+    # Determine which context to use and output directory
+    if args.context == "refined":
+        context_source_dir = context_refinement_dir
+        context_file = "refined_context_with_embeddings.pkl"
+        output_dir = "/hpc/group/fanglab/xx102/vpl_llm/inference_results_refined_context"
+        context_label = "REFINED"
+    else:
+        context_source_dir = context_optimization_dir
+        context_file = "best_context_with_embeddings.pkl"
+        output_dir = "/hpc/group/fanglab/xx102/vpl_llm/inference_results_optimized_context"
+        context_label = "INITIAL (OPTIMIZED)"
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -508,6 +532,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Data subset: {data_subset}")
+    print(f"Context: {context_label}")
 
     # Setup arguments - matching training script arguments
     script_args = ScriptArguments()
@@ -540,18 +565,18 @@ def main():
         test_dataset = test_dataset.filter(lambda example: example.get('controversial', False) == True)
         print(f"After filtering to controversial: {len(test_dataset)} samples")
 
-    # Load best context from optimization
-    print("\n=== Loading Optimized Context ===")
+    # Load context from selected source
+    print(f"\n=== Loading {context_label} Context ===")
     import pickle
-    best_context_path = os.path.join(context_optimization_dir, "best_context_with_embeddings.pkl")
+    best_context_path = os.path.join(context_source_dir, context_file)
     if not os.path.exists(best_context_path):
-        print(f"WARNING: Best context file not found at {best_context_path}")
+        print(f"WARNING: Context file not found at {best_context_path}")
         print("Using contexts from test.jsonl (may be random contexts)")
         best_context = None
     else:
         with open(best_context_path, 'rb') as f:
             best_context = pickle.load(f)
-        print(f"Loaded best context with {len(best_context)} samples")
+        print(f"Loaded {context_label} context with {len(best_context)} samples")
 
     # Preprocess dataset matching training configuration
     print("\n=== Preprocessing Dataset ===")
