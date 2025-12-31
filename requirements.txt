@@ -1,4 +1,4 @@
-transformers
+transformers==4.38.0
 datasets>=1.17.0
 peft>=0.3.0
 sentencepiece
