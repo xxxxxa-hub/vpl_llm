@@ -30,6 +30,7 @@ import random
 sys.path.insert(0, '/hpc/group/fanglab/xx102/vpl_llm/hidden_context')
 
 from vae_utils import VAEModel
+from dataset_utils import split_dataset_simple, load_demo_from_survey_and_validation_from_train
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ScriptArguments:
     other_subsets: str = field(default="single")
     tokenizer_name: str = field(default=None)
     controversial_only: bool = field(default=False)
+    seed: int = field(default=42, metadata={"help": "Random seed for reproducibility"})
 
 
 class RewardDataCollatorWithPadding:
@@ -173,27 +175,6 @@ def load_survey_data(survey_path: str) -> List[Dict]:
     return data
 
 
-def split_survey_data(survey_data: List[Dict], demo_size: int = 10, validation_size: int = 50, seed: int = 0) -> Tuple[List[Dict], List[Dict]]:
-    """Split survey data into demo and validation sets.
-
-    Args:
-        survey_data: Full survey dataset
-        demo_size: Number of demo examples (default: 10)
-        validation_size: Number of validation examples (default: 50)
-        seed: Random seed for reproducibility
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-
-    shuffled_data = survey_data.copy()
-    random.shuffle(shuffled_data)
-
-    demo_data = shuffled_data[:demo_size]
-    validation_data = shuffled_data[demo_size:demo_size + validation_size]
-
-    return demo_data, validation_data
-
-
 def create_candidate_contexts(demo_data: List[Dict], num_candidates: int = 5, context_length: int = 8, seed: int = 42) -> List[List[Dict]]:
     """Bootstrap multiple candidate context sets from demo data."""
     candidates = []
@@ -271,7 +252,7 @@ def preprocess_validation_dataset(
     dataset = dataset.map(
         EvalPreprocessor(args, tokenizer, truncation=True, max_length=args.max_length),
         batched=True,
-        num_proc=1,
+        num_proc=10,
         remove_columns=original_columns,
     )
     dataset = dataset.filter(lambda x: x["max_lengths"] <= args.max_length)
@@ -344,20 +325,66 @@ def load_checkpoint(
     return vae_model, tokenizer
 
 
+def create_demo_based_context(demo_data: List[Dict]) -> List[Dict]:
+    """Create context examples from demo data with contradictory flipped versions.
+
+    Takes 20 demo examples and returns 40 total:
+    - Original 20 examples as-is (chosen is preferred)
+    - 20 flipped examples where chosen and rejected are swapped (rejected is preferred, contradicting the original)
+
+    Args:
+        demo_data: List of demo examples, each with 'chosen', 'rejected', and 'embeddings' fields
+
+    Returns:
+        List of 40 context examples (20 original + 20 flipped)
+    """
+    contexts = []
+
+    # Add original examples
+    for i, example in enumerate(demo_data):
+        context = {
+            "original_idx": f"demo_{i}",
+            "embeddings": {
+                "embedding_chosen": example["embeddings"]["embedding_chosen"],
+                "embedding_rejected": example["embeddings"]["embedding_rejected"],
+            }
+        }
+        contexts.append(context)
+
+    # Add flipped examples (contradictory preferences)
+    for i, example in enumerate(demo_data):
+        context = {
+            "original_idx": f"demo_flipped_{i}",
+            "embeddings": {
+                "embedding_chosen": example["embeddings"]["embedding_rejected"],
+                "embedding_rejected": example["embeddings"]["embedding_chosen"],
+            }
+        }
+        contexts.append(context)
+
+    return contexts
+
+
 def evaluate_context(
     model: VAEModel,
     validation_dataset: Dataset,
+    validation_data: List[Dict],
     tokenizer: PreTrainedTokenizerBase,
     args: ScriptArguments,
     device: str = "cuda",
+    baseline_contexts: List[Dict] = None,
 ) -> tuple:
-    """Evaluate a context set on validation dataset and return accuracy and SNR.
+    """Evaluate a context set on validation dataset using gain-based SNR metric.
+
+    Gain is computed as:
+    gain_i = log P(yi=yi_hat|x_i, context) - log P(yi=yi_hat|x_i)
 
     SNR is computed as:
-    SNR = mean(log P(true|chosen)) / std(log P(true|chosen))
+    SNR = mean(gain_i) / std(gain_i)
 
     where log P(true|x) = log_sigmoid(reward_score)
-    Measures how consistently high the model rates chosen responses.
+
+    The baseline log P(yi=yi_hat|x_i) is approximated using random meaningless contexts.
     """
 
     data_collator = RewardDataCollatorWithPadding(
@@ -367,15 +394,23 @@ def evaluate_context(
         pad_to_multiple_of=64,
     )
 
+    model = model.to(device)
+    model.eval()
+
+    # First, evaluate on baseline (random contexts) to get baseline log probs
+    print("  Computing baseline (no context)...")
+    baseline_log_probs = _compute_baseline_logprobs(
+        model, validation_data, tokenizer, args, baseline_contexts, device
+    )
+
+    # Then, evaluate with actual context
+    print("  Computing with context...")
     dataloader = DataLoader(
         validation_dataset,
         batch_size=args.per_device_eval_batch_size,
         collate_fn=data_collator,
         shuffle=False,
     )
-
-    model = model.to(device)
-    model.eval()
 
     accuracies = []
     log_probs_chosen = []
@@ -394,7 +429,7 @@ def evaluate_context(
 
             try:
                 seq_start_end = batch_on_device["seq_start_end"].to(device)
-                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.float32).to(device)
+                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.bfloat16).to(device)
 
                 # Compute embeddings from tokenized inputs
                 output = model.llm_encoder(
@@ -425,9 +460,11 @@ def evaluate_context(
                     False,
                 )
 
-                # Compute log P(true|x) = log_sigmoid(reward) for both chosen and rejected
-                log_prob_chosen = torch.nn.functional.logsigmoid(rewards_chosen).float().cpu().numpy().flatten()
-                log_prob_rejected = torch.nn.functional.logsigmoid(rewards_rejected).float().cpu().numpy().flatten()
+                # Compute normalized log probabilities using log_softmax
+                rewards = torch.stack([rewards_chosen, rewards_rejected], dim=-1)
+                log_probs = torch.nn.functional.log_softmax(rewards, dim=-1)
+                log_prob_chosen = log_probs[..., 0].float().cpu().numpy().flatten()
+                log_prob_rejected = log_probs[..., 1].float().cpu().numpy().flatten()
 
                 log_probs_chosen.extend(log_prob_chosen)
                 log_probs_rejected.extend(log_prob_rejected)
@@ -441,18 +478,167 @@ def evaluate_context(
 
     avg_accuracy = np.mean(accuracies) if accuracies else 0.0
 
-    # Compute SNR
+    # Compute gains: difference between context-enhanced and baseline predictions
     log_probs_chosen = np.array(log_probs_chosen)
-    log_probs_rejected = np.array(log_probs_rejected)
+    baseline_chosen = np.array(baseline_log_probs["chosen"])
 
-    mean_chosen = np.mean(log_probs_chosen)
-    std_chosen = np.std(log_probs_chosen)
+    gains = log_probs_chosen - baseline_chosen
+
+    # Compute SNR on gains
+    mean_gain = np.mean(gains)
+    std_gain = np.std(gains)
 
     # SNR = signal_strength / signal_variance
-    # Measures how consistently high the model rates chosen responses
-    snr = mean_chosen / (std_chosen + 1e-8)  # Add small epsilon to avoid division by zero
+    snr = mean_gain / (std_gain + 1e-8)  # Add small epsilon to avoid division by zero
 
     return float(avg_accuracy), float(snr)
+
+
+def _compute_baseline_logprobs(
+    model: VAEModel,
+    validation_data: List[Dict],
+    tokenizer: PreTrainedTokenizerBase,
+    args: ScriptArguments,
+    baseline_contexts: List[Dict],
+    device: str = "cuda",
+) -> Dict[str, List]:
+    """Compute baseline log probabilities using provided baseline contexts."""
+
+    # Create a validation dataset with baseline contexts
+    baseline_val_data = apply_context_to_dataset(
+        validation_data,
+        baseline_contexts,
+        context_length=len(baseline_contexts)
+    )
+
+    # Convert the dataset properly
+    baseline_dict = {
+        "chosen": [item["chosen"] for item in baseline_val_data],
+        "rejected": [item["rejected"] for item in baseline_val_data],
+        "contexts": [item["contexts"] for item in baseline_val_data],
+        "data_subset": [item["data_subset"] for item in baseline_val_data],
+    }
+    baseline_dataset = Dataset.from_dict(baseline_dict)
+
+    class BaselinePreprocessor:
+        def __init__(self, args, tokenizer, baseline_contexts, **tokenizer_kwargs):
+            self.tokenizer = tokenizer
+            self.args = args
+            self.tokenizer_kwargs = tokenizer_kwargs
+            self.baseline_contexts = baseline_contexts
+
+        def __call__(self, examples):
+            new_examples = {
+                "input_ids_chosen": [],
+                "attention_mask_chosen": [],
+                "input_ids_rejected": [],
+                "attention_mask_rejected": [],
+                "contexts_embeddings": [],
+            }
+            for chosen, rejected, contexts, user_type in zip(
+                examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
+            ):
+                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+
+                new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+                new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+                new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+                new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+
+                contexts_embeddings = [
+                    {
+                        "embedding_chosen": context["embedding_chosen"],
+                        "embedding_rejected": context["embedding_rejected"]
+                    }
+                    for context in contexts
+                ]
+                new_examples["contexts_embeddings"].append(contexts_embeddings)
+
+            new_examples["user_type"] = examples["data_subset"]
+            return new_examples
+
+    original_columns = baseline_dataset.column_names
+    baseline_dataset = baseline_dataset.map(
+        BaselinePreprocessor(args, tokenizer, baseline_contexts, truncation=True, max_length=args.max_length),
+        batched=True,
+        num_proc=10,
+        remove_columns=original_columns,
+    )
+
+    data_collator = RewardDataCollatorWithPadding(
+        args=args,
+        tokenizer=tokenizer,
+        max_length=args.max_length,
+        pad_to_multiple_of=64,
+    )
+
+    dataloader = DataLoader(
+        baseline_dataset,
+        batch_size=args.per_device_eval_batch_size,
+        collate_fn=data_collator,
+        shuffle=False,
+    )
+
+    baseline_log_probs = {"chosen": [], "rejected": []}
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            batch_on_device = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch_on_device[k] = v.to(device)
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+                    batch_on_device[k] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in v]
+                else:
+                    batch_on_device[k] = v
+
+            try:
+                seq_start_end = batch_on_device["seq_start_end"].to(device)
+                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.bfloat16).to(device)
+
+                output = model.llm_encoder(
+                    input_ids=torch.concatenate([
+                        batch_on_device["input_ids_chosen"],
+                        batch_on_device["input_ids_rejected"],
+                    ], dim=0),
+                    attention_mask=torch.concatenate([
+                        batch_on_device["attention_mask_chosen"],
+                        batch_on_device["attention_mask_rejected"],
+                    ], dim=0),
+                )
+                embeddings = output[0]
+                batch_size = batch_on_device["seq_start_end"].shape[0]
+                embeddings_chosen = embeddings[:batch_size]
+                embeddings_rejected = embeddings[batch_size:]
+
+                contexts_embeddings_chosen = torch.tensor(batch_on_device["contexts_embeddings_chosen"], dtype=torch.bfloat16).to(device)
+                contexts_embeddings_rejected = torch.tensor(batch_on_device["contexts_embeddings_rejected"], dtype=torch.bfloat16).to(device)
+
+                rewards_chosen, rewards_rejected, _, _, _ = model(
+                    embeddings_chosen,
+                    embeddings_rejected,
+                    contexts_embeddings_chosen,
+                    contexts_embeddings_rejected,
+                    seq_start_end,
+                    user_type_batch,
+                    False,
+                )
+
+                # Compute normalized log probabilities using log_softmax
+                rewards = torch.stack([rewards_chosen, rewards_rejected], dim=-1)
+                log_probs = torch.nn.functional.log_softmax(rewards, dim=-1)
+                log_prob_chosen = log_probs[..., 0].float().cpu().numpy().flatten()
+                log_prob_rejected = log_probs[..., 1].float().cpu().numpy().flatten()
+
+                baseline_log_probs["chosen"].extend(log_prob_chosen)
+                baseline_log_probs["rejected"].extend(log_prob_rejected)
+
+            except Exception as e:
+                print(f"Error processing baseline batch {batch_idx}: {e}")
+                continue
+
+    return baseline_log_probs
 
 
 def apply_context_to_dataset(dataset_data: List[Dict], context: List[Dict], context_length: int = 8) -> List[Dict]:
@@ -464,7 +650,7 @@ def apply_context_to_dataset(dataset_data: List[Dict], context: List[Dict], cont
         # Create context_embeddings from the fixed context
         contexts_embeddings = [
             {
-                "original_id": ctx["Index"],
+                "original_idx": ctx["original_idx"],
                 "embedding_chosen": ctx["embeddings"]["embedding_chosen"],
                 "embedding_rejected": ctx["embeddings"]["embedding_rejected"],
             }
@@ -497,26 +683,34 @@ def main():
         choices=["1", "2", "4", "8"],
         help="Data subset to optimize context for: '1', '2', '4', or '8'. Default: 8"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility. Default: 42"
+    )
     cmd_args = parser.parse_args()
 
     # Configuration
     data_subset = cmd_args.subset
-    survey_path = f"/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4/{data_subset}/survey_100.jsonl"
+    seed = cmd_args.seed
+    survey_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4"
+    train_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}"
+    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}_seed{seed}"
 
     # Fixed parameters
     context_length = 8
-    num_candidates = 50
-    demo_size = 20  # Small demo set for bootstrapping contexts
-    validation_size = 20  # Larger validation set for reliable evaluation
+    num_candidates = 20
+    demo_size = 50  # Demo set for bootstrapping contexts (from survey)
+    validation_size = 50  # Validation set for evaluation (from train.jsonl)
 
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Using device: {device}")
-    print(f"Survey path: {survey_path}")
     print(f"Data subset: {data_subset}")
+    print(f"Random seed: {seed}")
     print(f"Context length: {context_length}")
 
     # Setup arguments
@@ -526,21 +720,27 @@ def main():
     args.fixed_contexts = True
     args.fixed_llm_embeddings = False
     args.other_subsets = "single"
+    args.seed = seed
 
-    # Load survey data
-    print("\n=== Loading Survey Data ===")
-    survey_data = load_survey_data(survey_path)
-    print(f"Loaded {len(survey_data)} survey samples")
+    # Load demo from survey and validation from train
+    print("\n=== Loading Demo Set (from Survey) and Validation Set (from Train) ===")
+    demo_datasets, validation_datasets = load_demo_from_survey_and_validation_from_train(
+        survey_data_path,
+        train_data_path,
+        subsets=[data_subset],
+        demo_size=demo_size,
+        validation_size=validation_size,
+        seed=seed,
+    )
 
-    # Split data
-    print("\n=== Splitting Survey Data ===")
-    demo_data, validation_data = split_survey_data(survey_data, demo_size=demo_size, validation_size=validation_size)
+    demo_data = list(demo_datasets[data_subset]) if hasattr(demo_datasets[data_subset], '__iter__') else demo_datasets[data_subset]
+    validation_data = list(validation_datasets[data_subset]) if hasattr(validation_datasets[data_subset], '__iter__') else validation_datasets[data_subset]
     print(f"Demo samples: {len(demo_data)}")
     print(f"Validation samples: {len(validation_data)}")
 
     # Create candidate contexts
     print("\n=== Creating Candidate Contexts ===")
-    candidates = create_candidate_contexts(demo_data, num_candidates=num_candidates, context_length=context_length)
+    candidates = create_candidate_contexts(demo_data, num_candidates=num_candidates, context_length=context_length, seed=seed)
     print(f"Created {len(candidates)} candidate context sets")
 
     # Load checkpoint
@@ -553,6 +753,11 @@ def main():
         hidden_dim=512,
         latent_dim=512,
     )
+
+    # Create baseline contexts from demo data (20 original + 20 flipped for contradictory preferences)
+    print("\n=== Creating Baseline Contexts from Demo Data ===")
+    baseline_contexts = create_demo_based_context(demo_data)
+    print(f"Created {len(baseline_contexts)} baseline contexts from demo data ({len(demo_data)} original + {len(demo_data)} flipped)")
 
     # Evaluate each candidate
     print("\n=== Evaluating Candidates ===")
@@ -568,16 +773,16 @@ def main():
         val_dataset = preprocess_validation_dataset(val_with_context, tokenizer, args)
         print(f"  Preprocessed validation set: {len(val_dataset)} samples")
 
-        # Evaluate
-        accuracy, snr = evaluate_context(vae_model, val_dataset, tokenizer, args, device)
+        # Evaluate with gain-based metric
+        accuracy, snr = evaluate_context(vae_model, val_dataset, val_with_context, tokenizer, args, device, baseline_contexts)
         print(f"  Accuracy: {accuracy:.6f}")
-        print(f"  SNR: {snr:.6f}")
+        print(f"  SNR (gain-based): {snr:.6f}")
 
         results.append({
             "candidate_idx": candidate_idx,
             "accuracy": accuracy,
             "snr": snr,
-            "context_indices": [ctx["Index"] for ctx in candidate_context],
+            "context_indices": [ctx["original_idx"] for ctx in candidate_context],
         })
 
     # Find best candidate by SNR
