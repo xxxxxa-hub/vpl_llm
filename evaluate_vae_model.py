@@ -22,6 +22,9 @@ sys.path.insert(0, '/hpc/group/fanglab/xx102/vpl_llm/hidden_context')
 # Import VAE components
 from vae_utils import VAEModel, VAETrainer
 
+# Import dataset utilities
+from dataset_utils import load_and_split_survey_data
+
 # Import classes we need from the training script (avoiding relative imports)
 from transformers.utils import PaddingStrategy
 import torch.nn as nn
@@ -173,6 +176,113 @@ class RewardDataCollatorWithPadding:
         return {}
 
 
+class SurveyContextPreprocessor:
+    """Data preprocessor for evaluation with randomly sampled survey contexts."""
+
+    def __init__(
+        self,
+        args: ScriptArguments,
+        tokenizer: PreTrainedTokenizerBase,
+        demo_datasets: Dict[str, Dataset],
+        num_contexts: int = 8,
+        random_seed: int = 0,
+        **tokenizer_kwargs
+    ):
+        self.tokenizer = tokenizer
+        self.args = args
+        self.tokenizer_kwargs = tokenizer_kwargs
+        self.demo_datasets = demo_datasets
+        self.num_contexts = num_contexts
+        self.random_seed = random_seed
+        self.rng = np.random.RandomState(random_seed)
+        self.example_counter = 0
+
+    def _sample_contexts(self, subset: str, seed_offset: int = 0) -> List[Dict[str, Any]]:
+        """Sample random contexts from demo dataset for a given subset."""
+        demo_dataset = self.demo_datasets[subset]
+
+        # Ensure we have enough demo samples
+        if len(demo_dataset) < self.num_contexts:
+            raise ValueError(
+                f"Subset {subset}: demo dataset has {len(demo_dataset)} samples "
+                f"but need {self.num_contexts} for context sampling"
+            )
+
+        # Per-example deterministic sampling
+        rng = np.random.RandomState(self.random_seed + seed_offset)
+        sampled_indices = rng.choice(len(demo_dataset), self.num_contexts, replace=False)
+
+        contexts = []
+        for idx in sampled_indices:
+            example = demo_dataset[int(idx)]
+            contexts.append({
+                "embedding_chosen": example["embeddings"]["embedding_chosen"],
+                "embedding_rejected": example["embeddings"]["embedding_rejected"],
+            })
+
+        return contexts
+
+    def __call__(self, examples):
+        if self.args.fixed_llm_embeddings:
+            # Fixed embeddings mode
+            new_examples = {
+                "embedding_chosen": [],
+                "embedding_rejected": [],
+                "contexts_embeddings": [],
+                "max_lengths": []
+            }
+            for i, (embeddings, data_subset) in enumerate(
+                zip(examples["embeddings"], examples["data_subset"])
+            ):
+                new_examples["embedding_chosen"].append(embeddings["embedding_chosen"])
+                new_examples["embedding_rejected"].append(embeddings["embedding_rejected"])
+
+                # Sample random contexts from survey data
+                contexts_embeddings = self._sample_contexts(data_subset, seed_offset=self.example_counter + i)
+                new_examples["contexts_embeddings"].append(contexts_embeddings)
+                new_examples["max_lengths"].append(0)
+
+            new_examples["user_type"] = examples["data_subset"]
+            self.example_counter += len(examples["embeddings"])
+            return new_examples
+        else:
+            # Tokenize chosen/rejected but use randomly sampled context embeddings
+            new_examples = {
+                "input_ids_chosen": [],
+                "attention_mask_chosen": [],
+                "input_ids_rejected": [],
+                "attention_mask_rejected": [],
+                "contexts_embeddings": [],
+                "max_lengths": []
+            }
+
+            for i, (chosen, rejected, data_subset) in enumerate(
+                zip(examples["chosen"], examples["rejected"], examples["data_subset"])
+            ):
+                max_length = 0
+                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+
+                new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+                new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+                new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+                new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+
+                max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+                max_length = max(max_length, len(tokenized_rejected["input_ids"]))
+
+                # Sample random contexts from survey data
+                contexts_embeddings = self._sample_contexts(data_subset, seed_offset=self.example_counter + i)
+                new_examples["contexts_embeddings"].append(contexts_embeddings)
+                new_examples["max_lengths"].append(max_length)
+
+            new_examples["user_type"] = examples["data_subset"]
+            self.example_counter += len(examples["chosen"])
+            return new_examples
+
+
+
+
 def load_custom_dataset(data_path: str, split: str = "test", subset = "8") -> Dataset:
     """Load dataset from custom JSONL files in directory structure.
 
@@ -225,9 +335,56 @@ def preprocess_dataset_matching_training(
     dataset: Dataset,
     tokenizer: PreTrainedTokenizerBase,
     args: ScriptArguments,
+    use_survey_contexts: bool = False,
+    demo_datasets: Optional[Dict[str, Dataset]] = None,
+    num_contexts: int = 8,
+    random_seed: int = 0,
     num_proc: int = 24
 ) -> Dataset:
-    """Preprocess dataset to match training configuration."""
+    """Preprocess dataset to match training configuration.
+
+    Args:
+        dataset: The test dataset to preprocess
+        tokenizer: Tokenizer for encoding text
+        args: Script arguments
+        use_survey_contexts: If True, use SurveyContextPreprocessor for random context sampling
+        demo_datasets: Demo datasets for context sampling (required if use_survey_contexts=True)
+        num_contexts: Number of contexts to sample per example (default: 8)
+        random_seed: Random seed for reproducibility (default: 0)
+        num_proc: Number of processes for parallel processing (default: 24)
+
+    Returns:
+        Preprocessed dataset
+    """
+    # Use survey contexts with random sampling
+    if use_survey_contexts:
+        if demo_datasets is None:
+            raise ValueError("demo_datasets required when use_survey_contexts=True")
+
+        original_columns = dataset.column_names
+        preprocessor = SurveyContextPreprocessor(
+            args,
+            tokenizer,
+            demo_datasets=demo_datasets,
+            num_contexts=num_contexts,
+            random_seed=random_seed,
+            truncation=True,
+            max_length=args.max_length
+        )
+
+        dataset = dataset.map(
+            preprocessor,
+            batched=True,
+            num_proc=num_proc,
+            remove_columns=original_columns,
+        )
+
+        # Filter by max length
+        dataset = dataset.filter(lambda x: x["max_lengths"] <= args.max_length)
+
+        return dataset
+
+    # Original behavior with pre-computed contexts from test.jsonl
     from vae_utils import VAEModel  # Import here to get access to HHRLHFPreprocessor
 
     # Import HHRLHFPreprocessor from training script
@@ -432,7 +589,7 @@ def evaluate_model(
             # Forward pass through the model (matching training code structure)
             try:
                 seq_start_end = batch_on_device["seq_start_end"].to(device)
-                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.float32).to(device)
+                user_type_batch = torch.tensor(batch_on_device["user_type"], dtype=torch.bfloat16).to(device)
 
                 # Handle fixed_llm_embeddings case
                 if model.fixed_llm_embeddings:
@@ -562,6 +719,24 @@ def main():
         choices=["1", "2", "4", "8", "single", "84"],
         help="Data subset to evaluate: '8', '4', '2', '1', 'single' (8,4,2,1), or '84' (8,4). Default: 8"
     )
+    parser.add_argument(
+        "--use_survey_contexts",
+        action="store_true",
+        default=False,
+        help="Use randomly sampled contexts from survey_100.jsonl instead of pre-computed contexts from test.jsonl"
+    )
+    parser.add_argument(
+        "--num_contexts",
+        type=int,
+        default=8,
+        help="Number of contexts to sample per test example (default: 8)"
+    )
+    parser.add_argument(
+        "--context_seed",
+        type=int,
+        default=0,
+        help="Random seed for context sampling (default: 0)"
+    )
     args = parser.parse_args()
 
     # Configuration - adjust these based on your checkpoint
@@ -620,9 +795,31 @@ def main():
         test_dataset = test_dataset.filter(lambda example: example.get('controversial', False) == True)
         print(f"After filtering to controversial: {len(test_dataset)} samples")
 
+    # Load and split survey data for context sampling if requested
+    demo_datasets = None
+    if args.use_survey_contexts:
+        print("\n=== Loading Survey Data for Context Sampling ===")
+        survey_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4"
+        demo_datasets, val_datasets = load_and_split_survey_data(
+            survey_data_path,
+            subsets=subsets,
+            demo_size=50,
+            validation_size=50,
+            seed=args.context_seed,
+        )
+        print(f"Survey data split complete. Using demo sets for context sampling.")
+
     # Preprocess dataset matching training configuration
     print("\n=== Preprocessing Dataset ===")
-    test_dataset = preprocess_dataset_matching_training(test_dataset, tokenizer, script_args)
+    test_dataset = preprocess_dataset_matching_training(
+        test_dataset,
+        tokenizer,
+        script_args,
+        use_survey_contexts=args.use_survey_contexts,
+        demo_datasets=demo_datasets,
+        num_contexts=args.num_contexts,
+        random_seed=args.context_seed,
+    )
     print(f"After preprocessing: {len(test_dataset)} samples")
 
     # Create data loader
