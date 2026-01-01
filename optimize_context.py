@@ -130,6 +130,7 @@ def main():
     # Evaluate each candidate
     print("\n=== Evaluating Candidates ===")
     results = []
+    all_gains = []  # Store gains for all candidates
 
     for candidate_idx, candidate_context in enumerate(candidates):
         print(f"\nEvaluating candidate {candidate_idx + 1}/{len(candidates)}...")
@@ -142,7 +143,7 @@ def main():
         print(f"  Preprocessed validation set: {len(val_dataset)} samples")
 
         # Evaluate with gain-based metric
-        accuracy, snr = evaluate_context(vae_model, val_dataset, val_with_context, tokenizer, args, device, baseline_contexts)
+        accuracy, snr, gains = evaluate_context(vae_model, val_dataset, val_with_context, tokenizer, args, device, baseline_contexts)
         print(f"  Accuracy: {accuracy:.6f}")
         print(f"  SNR (gain-based): {snr:.6f}")
 
@@ -151,6 +152,12 @@ def main():
             "accuracy": accuracy,
             "snr": snr,
             "context_indices": [ctx["original_idx"] for ctx in candidate_context],
+        })
+
+        # Record gains for this candidate
+        all_gains.append({
+            "candidate_idx": candidate_idx,
+            "gains": gains.tolist() if hasattr(gains, 'tolist') else list(gains),
         })
 
     # Find best candidate by SNR
@@ -171,6 +178,12 @@ def main():
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {results_path}")
+
+    # Save gains with subset and seed in filename
+    gains_path = os.path.join(output_dir, f"gains_subset_{data_subset}_seed{seed}.json")
+    with open(gains_path, 'w') as f:
+        json.dump(all_gains, f, indent=2)
+    print(f"Gains saved to {gains_path}")
 
     # Save best context
     best_context = candidates[best_result["candidate_idx"]]

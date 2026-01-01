@@ -737,6 +737,9 @@ def evaluate_context(
     where log P(true|x) = log_sigmoid(reward_score)
 
     The baseline log P(yi=yi_hat|x_i) is approximated using random meaningless contexts.
+
+    Returns:
+        Tuple of (avg_accuracy, snr, gains) where gains is a numpy array of individual gains
     """
 
     data_collator = RewardDataCollatorWithPadding(
@@ -836,7 +839,7 @@ def evaluate_context(
     # SNR = signal_strength / signal_variance
     snr = mean_gain / (std_gain + 1e-8)  # Add small epsilon to avoid division by zero
 
-    return float(avg_accuracy), float(snr)
+    return float(avg_accuracy), float(snr), gains
 
 
 def save_jsonl(data: List[Dict], output_path: str):
