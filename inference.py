@@ -11,6 +11,7 @@ import numpy as np
 from typing import Dict, Any, Tuple
 from torch.utils.data import DataLoader
 
+from utils import move_batch_to_device
 
 def run_inference(
     model,
@@ -49,14 +50,7 @@ def run_inference(
             if batch_idx % 100 == 0:
                 print(f"  Processing batch {batch_idx}...")
 
-            batch_on_device = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_on_device[k] = v.to(device)
-                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                    batch_on_device[k] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in v]
-                else:
-                    batch_on_device[k] = v
+            batch_on_device = move_batch_to_device(batch, device)
 
             try:
                 seq_start_end = batch_on_device["seq_start_end"].to(device)

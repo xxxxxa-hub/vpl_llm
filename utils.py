@@ -521,55 +521,79 @@ def create_demo_based_context(demo_data: List[Dict]) -> List[Dict]:
     return contexts
 
 
+def move_batch_to_device(batch: Dict, device: str) -> Dict:
+    """Move batch tensors to specified device.
+
+    Args:
+        batch: Dictionary containing batch data with tensors and other types
+        device: Device to move tensors to (e.g., "cuda", "cpu")
+
+    Returns:
+        Dictionary with all tensors moved to the specified device
+    """
+    batch_on_device = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            batch_on_device[k] = v.to(device)
+        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+            batch_on_device[k] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in v]
+        else:
+            batch_on_device[k] = v
+    return batch_on_device
+
+
+class EvalPreprocessor:
+    """Preprocessor for evaluation datasets with tokenization and context extraction."""
+
+    def __init__(self, args, tokenizer, **tokenizer_kwargs):
+        self.tokenizer = tokenizer
+        self.args = args
+        self.tokenizer_kwargs = tokenizer_kwargs
+
+    def __call__(self, examples):
+        new_examples = {
+            "input_ids_chosen": [],
+            "attention_mask_chosen": [],
+            "input_ids_rejected": [],
+            "attention_mask_rejected": [],
+            "contexts_embeddings": [],
+            "max_lengths": []
+        }
+        for chosen, rejected, contexts, user_type in zip(
+            examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
+        ):
+            max_length = 0
+            tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+            tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+
+            new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+            new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+            new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+            new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+
+            max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+            max_length = max(max_length, len(tokenized_rejected["input_ids"]))
+
+            contexts_embeddings = [
+                {
+                    "embedding_chosen": context["embedding_chosen"],
+                    "embedding_rejected": context["embedding_rejected"]
+                }
+                for context in contexts
+            ]
+            new_examples["contexts_embeddings"].append(contexts_embeddings)
+            new_examples["max_lengths"].append(max_length)
+
+        new_examples["user_type"] = examples["data_subset"]
+        return new_examples
+
+
 def preprocess_validation_dataset(
     validation_data: List[Dict],
     tokenizer: PreTrainedTokenizerBase,
     args: ScriptArguments,
 ) -> Dataset:
     """Preprocess validation dataset matching training format."""
-
-    class EvalPreprocessor:
-        def __init__(self, args, tokenizer, **tokenizer_kwargs):
-            self.tokenizer = tokenizer
-            self.args = args
-            self.tokenizer_kwargs = tokenizer_kwargs
-
-        def __call__(self, examples):
-            new_examples = {
-                "input_ids_chosen": [],
-                "attention_mask_chosen": [],
-                "input_ids_rejected": [],
-                "attention_mask_rejected": [],
-                "contexts_embeddings": [],
-                "max_lengths": []
-            }
-            for chosen, rejected, contexts, user_type in zip(
-                examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
-            ):
-                max_length = 0
-                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
-                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-
-                new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
-                new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
-                new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
-                new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
-
-                max_length = max(max_length, len(tokenized_chosen["input_ids"]))
-                max_length = max(max_length, len(tokenized_rejected["input_ids"]))
-
-                contexts_embeddings = [
-                    {
-                        "embedding_chosen": context["embedding_chosen"],
-                        "embedding_rejected": context["embedding_rejected"]
-                    }
-                    for context in contexts
-                ]
-                new_examples["contexts_embeddings"].append(contexts_embeddings)
-                new_examples["max_lengths"].append(max_length)
-
-            new_examples["user_type"] = examples["data_subset"]
-            return new_examples
 
     # Convert to HF Dataset
     dataset_dict = {
@@ -617,47 +641,9 @@ def _compute_baseline_logprobs(
     }
     baseline_dataset = Dataset.from_dict(baseline_dict)
 
-    class BaselinePreprocessor:
-        def __init__(self, args, tokenizer, baseline_contexts, **tokenizer_kwargs):
-            self.tokenizer = tokenizer
-            self.args = args
-            self.tokenizer_kwargs = tokenizer_kwargs
-            self.baseline_contexts = baseline_contexts
-
-        def __call__(self, examples):
-            new_examples = {
-                "input_ids_chosen": [],
-                "attention_mask_chosen": [],
-                "input_ids_rejected": [],
-                "attention_mask_rejected": [],
-                "contexts_embeddings": [],
-            }
-            for chosen, rejected, contexts, user_type in zip(
-                examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
-            ):
-                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
-                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-
-                new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
-                new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
-                new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
-                new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
-
-                contexts_embeddings = [
-                    {
-                        "embedding_chosen": context["embedding_chosen"],
-                        "embedding_rejected": context["embedding_rejected"]
-                    }
-                    for context in contexts
-                ]
-                new_examples["contexts_embeddings"].append(contexts_embeddings)
-
-            new_examples["user_type"] = examples["data_subset"]
-            return new_examples
-
     original_columns = baseline_dataset.column_names
     baseline_dataset = baseline_dataset.map(
-        BaselinePreprocessor(args, tokenizer, baseline_contexts, truncation=True, max_length=args.max_length),
+        EvalPreprocessor(args, tokenizer, truncation=True, max_length=args.max_length),
         batched=True,
         num_proc=10,
         remove_columns=original_columns,
@@ -681,14 +667,7 @@ def _compute_baseline_logprobs(
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            batch_on_device = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_on_device[k] = v.to(device)
-                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                    batch_on_device[k] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in v]
-                else:
-                    batch_on_device[k] = v
+            batch_on_device = move_batch_to_device(batch, device)
 
             try:
                 seq_start_end = batch_on_device["seq_start_end"].to(device)
@@ -791,14 +770,7 @@ def evaluate_context(
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            batch_on_device = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_on_device[k] = v.to(device)
-                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                    batch_on_device[k] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in v]
-                else:
-                    batch_on_device[k] = v
+            batch_on_device = move_batch_to_device(batch, device)
 
             try:
                 seq_start_end = batch_on_device["seq_start_end"].to(device)
