@@ -57,29 +57,61 @@ def main():
         default=42,
         help="Random seed for reproducibility. Default: 42"
     )
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        default=8,
+        help="Number of context examples per candidate. Default: 8"
+    )
+    parser.add_argument(
+        "--num-candidates",
+        type=int,
+        default=50,
+        help="Number of candidate contexts to generate and evaluate. Default: 50"
+    )
+    parser.add_argument(
+        "--demo-size",
+        type=int,
+        default=50,
+        help="Number of demo examples to use from survey. Default: 50"
+    )
+    parser.add_argument(
+        "--validation-size",
+        type=int,
+        default=50,
+        help="Number of validation examples to use from train. Default: 50"
+    )
     cmd_args = parser.parse_args()
 
     # Configuration
     data_subset = cmd_args.subset
     seed = cmd_args.seed
+    context_length = cmd_args.context_length
+    num_candidates = cmd_args.num_candidates
+    demo_size = cmd_args.demo_size
+    validation_size = cmd_args.validation_size
+
     survey_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4"
     train_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/context_optimization_subset_{data_subset}_seed{seed}"
 
-    # Fixed parameters
-    context_length = 8
-    num_candidates = 50
-    demo_size = 50  # Demo set for bootstrapping contexts (from survey)
-    validation_size = 50  # Validation set for evaluation (from train.jsonl)
+    # Create results directory structure with all arguments in folder name
+    results_base_dir = "/hpc/group/fanglab/xx102/vpl_llm/results"
+    output_dir = os.path.join(
+        results_base_dir,
+        f"context_optimization_subset_{data_subset}_demo_{demo_size}_validation_{validation_size}_candidates_{num_candidates}_context_{context_length}_seed{seed}"
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Using device: {device}")
     print(f"Data subset: {data_subset}")
-    print(f"Random seed: {seed}")
+    print(f"Demo size: {demo_size}")
+    print(f"Validation size: {validation_size}")
+    print(f"Num candidates: {num_candidates}")
     print(f"Context length: {context_length}")
+    print(f"Random seed: {seed}")
 
     # Setup arguments
     args = ScriptArguments()

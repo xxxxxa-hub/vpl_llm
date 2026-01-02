@@ -72,27 +72,39 @@ def main():
         default=42,
         help="Random seed for reproducibility. Default: 42"
     )
+    parser.add_argument(
+        "--demo-size",
+        type=int,
+        default=50,
+        help="Number of demo examples to use. Default: 50"
+    )
     args = parser.parse_args()
 
     # Configuration
     data_subset = args.subset
     seed = args.seed
+    demo_size = args.demo_size
+    num_candidates = args.num_candidates
+    context_length = args.context_length
+
     test_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
     train_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/data_release/P_4_survey_100/gpt2"
     survey_data_path = "/hpc/group/fanglab/xx102/vpl_llm/data/UltraFeedback_single_P_4"
     checkpoint_path = "/hpc/group/fanglab/xx102/vpl_llm/logs/gpt2_P_4_survey_100/all/vae_gpt2__0_0.0001_cosine_2_3e-06_512_768_seed0_peft_last_checkpoint"
-    output_dir = f"/hpc/group/fanglab/xx102/vpl_llm/candidate_evaluation_subset_{data_subset}_seed{seed}"
 
-    # Fixed parameters
-    num_candidates = args.num_candidates
-    context_length = args.context_length
-    demo_size = 50
+    # Create results directory structure with all arguments in folder name
+    results_base_dir = "/hpc/group/fanglab/xx102/vpl_llm/results"
+    output_dir = os.path.join(
+        results_base_dir,
+        f"candidate_evaluation_subset_{data_subset}_demo_{demo_size}_candidates_{num_candidates}_context_{context_length}_seed{seed}"
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Using device: {device}")
     print(f"Data subset: {data_subset}")
+    print(f"Demo size: {demo_size}")
     print(f"Random seed: {seed}")
     print(f"Number of candidates: {num_candidates}")
     print(f"Context length: {context_length}")
@@ -135,7 +147,7 @@ def main():
     print("\n=== Generating Candidate Contexts ===")
     candidates = create_candidate_contexts(demo_data, num_candidates=num_candidates, context_length=context_length, seed=seed)
     print(f"Generated {len(candidates)} candidate context sets")
-
+    breakpoint()
     # Load checkpoint
     print("\n=== Loading VAE Model ===")
     vae_model, tokenizer = load_checkpoint(
